@@ -1,0 +1,9 @@
+[project]
+name = "sec3-ssh-cert"
+version = "0.1.0"
+description = "SSH host and user certificate validation helpers"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
