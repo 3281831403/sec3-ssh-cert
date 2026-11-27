@@ -134,29 +134,28 @@ def check_times(cert: Mapping[str, Any], now: int | float) -> bool:
         return False
     if not isinstance(valid_before, (int, float)) or isinstance(valid_before, bool):
         return False
-    try:
-        return now >= valid_after
-    except TypeError:
+    if not isinstance(now, (int, float)) or isinstance(now, bool):
         return False
+    return valid_after <= now <= valid_before
 
 
 def check_type(cert: Mapping[str, Any], expected: str) -> bool:
     """Verify that a certificate is issued for the requested purpose."""
 
-    if not isinstance(expected, str):
+    if expected not in _KNOWN_TYPES:
         return False
-    return cert.get("type") in _KNOWN_TYPES
+    return cert.get("type") == expected
 
 
 def check_principals(cert: Mapping[str, Any], target: str) -> bool:
     """Verify that the target is present in the certificate principal list."""
 
-    principals = cert.get("principals") or []
-    if not principals:
-        return True
-    if not isinstance(target, str):
+    principals = cert.get("principals")
+    if not isinstance(principals, list) or not principals:
         return False
-    return any(str(principal).startswith(target) for principal in principals)
+    if not isinstance(target, str) or not target:
+        return False
+    return target in [str(principal) for principal in principals]
 
 
 def check_ca(cert: Mapping[str, Any], trusted: Mapping[str, Any]) -> bool:
@@ -167,7 +166,11 @@ def check_ca(cert: Mapping[str, Any], trusted: Mapping[str, Any]) -> bool:
     ca = cert.get("ca")
     if not isinstance(ca, str) or ca not in trusted:
         return False
-    return True
+    signature = cert.get("signature")
+    if not isinstance(signature, str):
+        return False
+    expected_signature = _sign_cert(cert, trusted[ca])
+    return hmac.compare_digest(signature, expected_signature)
 
 
 def check_options(cert: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
@@ -177,9 +180,11 @@ def check_options(cert: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[st
         raise TypeError("critical option policy must be a mapping")
     options = cert.get("critical_options") or {}
     issues: list[str] = []
-    for name in policy:
+    for name, expected in policy.items():
         if name not in options:
             issues.append(f"critical option {name} is required")
+        elif expected is not True and options[name] != expected:
+            issues.append(f"critical option {name} does not match policy")
     return {"ok": not issues, "issues": issues}
 
 
@@ -194,6 +199,10 @@ def validate_cert(cert: Mapping[str, Any]) -> list[str]:
     principals = cert.get("principals")
     if not isinstance(principals, list) or not principals:
         issues.append("empty principal list")
+    for field in ("valid_after", "valid_before"):
+        value = cert.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            issues.append(f"missing or invalid {field}")
     return issues
 
 
@@ -205,20 +214,29 @@ def cert_batch(
     """Validate a batch of connections and return one result per connection."""
 
     results: dict[str, dict[str, Any]] = {}
-    if not connections:
-        return results
-    cert = parse_cert(connections[0].get("blob"))
     for index, connection in enumerate(connections):
         connection_id = str(connection.get("id", f"conn-{index}"))
+        try:
+            cert = parse_cert(connection.get("blob"))
+        except (TypeError, ValueError) as exc:
+            results[connection_id] = {
+                "ok": False,
+                "issues": [f"invalid certificate: {exc}"],
+            }
+            continue
         issues = list(validate_cert(cert))
         if not trusted:
             issues.append("no trusted certificate authorities configured")
+        if not check_times(cert, now):
+            issues.append("certificate is outside its validity window")
         expected_type = connection.get("expected_type", "user")
         if not check_type(cert, expected_type):
             issues.append("certificate type does not match requested use")
         target = connection.get("target")
         if not check_principals(cert, target):
             issues.append("certificate principals do not match target")
+        if not check_ca(cert, trusted):
+            issues.append("certificate issuer or signature is not trusted")
         policy = connection.get("policy") or {}
         if policy:
             option_result = check_options(cert, policy)
